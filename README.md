@@ -1,5 +1,16 @@
 # Инструкция по установке и настройке:
 
+---
+
+# Установка и удаление Mixomo
+
+- для установки в **SSH** запустите скрипт:
+```
+sh <(wget -O - https://raw.githubusercontent.com/StressOzz/WARP_on_OpenWRT/main/Mihomo-OpenWRT_Manager.sh)
+```
+
+---
+
 # Генерируем WARP
 
 Генерируем **WARP** в TГ боте - https://t.me/warp_generator_bot
@@ -21,21 +32,6 @@
 
 - При нажатии на шестерёнку в углу, можно сменить DNS и выбрать локацию
 <img width="300" height="1441" alt="{A26E8E6A-0DC5-4F59-9F00-C77D7CD258B8}" src="https://github.com/user-attachments/assets/c9934736-a2ff-47c8-813f-16f4c0f750bc" />
-
-
----
-
-# Установка и удаление Mixomo
-
-- для установки в **SSH** запустите скрипт:
-```
-sh <(wget -O - https://raw.githubusercontent.com/StressOzz/WARP_on_OpenWRT/main/mixomo_openwrt_install.sh)
-```
-
-- для удаления в **SSH** запустите скрипт:
-```
-sh <(wget -O - https://raw.githubusercontent.com/StressOzz/WARP_on_OpenWRT/main/mixomo_openwrt_delete.sh)
-```
 
 ---
 
