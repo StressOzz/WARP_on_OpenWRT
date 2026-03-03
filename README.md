@@ -84,11 +84,11 @@ sh <(wget -O - https://raw.githubusercontent.com/StressOzz/Mihomo-OpenWRT_Manage
 ## Смена списков вручную
 
 - Переходим по ссылке 
-  https://github.com/StressOzz/Use_WARP_on_OpenWRT/blob/main/files/MagiTrickle/config_from_internet_helper.mtrickle
+  https://github.com/StressOzz/Mihomo-OpenWRT_Manager/blob/main/files/MagiTrickle/config_from_internet_helper.mtrickle
   
   или
   
-  https://github.com/StressOzz/WARP_on_OpenWRT/blob/main/files/MagiTrickle/AllowDomainsList.mtrickle
+  https://github.com/StressOzz/Mihomo-OpenWRT_Manager/blob/main/files/MagiTrickle/AllowDomainsList.mtrickle
 - Скачиваем файл <img width="197" height="155" alt="Image" src="https://github.com/user-attachments/assets/e07b23d3-f7cb-4fb8-a272-f46199cdd990" />
 - Зайдите на роутер в **LuCI** → `Services` → `Magitrickle` или в браузере http://192.168.1.1:8080/
 - Удалите `Example` <img width="371" height="401" alt="Image" src="https://github.com/user-attachments/assets/0f1c5f77-c72e-4790-8a22-d9277cfce934" />
@@ -103,11 +103,11 @@ sh <(wget -O - https://raw.githubusercontent.com/StressOzz/Mihomo-OpenWRT_Manage
 ---
 
 Cписок из **IT Dog Allow Domains** для **MagiTrickle**:
-https://github.com/StressOzz/WARP_on_OpenWRT/blob/main/files/MagiTrickle/AllowDomainsList.mtrickle
+https://github.com/StressOzz/Mihomo-OpenWRT_Manager/blob/main/files/MagiTrickle/AllowDomainsList.mtrickle
 
 Так же скрипт для создания этого списка из **Allow Domains**:
 ```
-sh <(wget -O - https://raw.githubusercontent.com/StressOzz/WARP_on_OpenWRT/main/AllowDomain_to_MagiTrickle.sh)
+sh <(wget -O - https://raw.githubusercontent.com/StressOzz/Mihomo-OpenWRT_Manager/main/AllowDomain_to_MagiTrickle.sh)
 ```
 
 ---
