@@ -7,7 +7,9 @@
 sh <(wget -O - https://raw.githubusercontent.com/StressOzz/Mihomo-OpenWRT_Manager/main/Mihomo-OpenWRT_Manager.sh)
 ```
 
-Для генерации **WARP** через скрипт возможно понадобится установить **[Zapret](https://github.com/StressOzz/Zapret-Manager)**...
+Для генерации **WARP** через скрипт возможно понадобится установить **[Zapret](https://github.com/StressOzz/Zapret-Manager)**
+
+Для интеграции своего **WARP** файла - скиньте его в `/root/WARP.conf`
 
 ---
 
