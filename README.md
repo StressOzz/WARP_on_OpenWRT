@@ -4,7 +4,7 @@
 
 - в **SSH** запустите скрипт:
 ```
-sh <(wget -O - https://raw.githubusercontent.com/StressOzz/WARP_on_OpenWRT/main/Mihomo-OpenWRT_Manager.sh)
+sh <(wget -O - https://raw.githubusercontent.com/StressOzz/Mihomo-OpenWRT_Manager/main/Mihomo-OpenWRT_Manager.sh)
 ```
 
 Для генерации **WARP** через скрипт возможно понадобится установить **Zapret**...
