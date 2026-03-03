@@ -27,7 +27,6 @@ echo
 while true; do
   echo -en "${YELLOW}Введите номер: ${NC}"
   read -r choice
-  choice="${choice:-2}"
 
   case "$choice" in
     1) MAGITRICKLE_CONFIG_URL="$URL_ITDOG"; break ;;
@@ -78,11 +77,11 @@ echo -e "╔══════════════════════�
 echo -e "║ ${BLUE}mihomo-openwrt on Internet-Helper Manager${NC} ║"
 echo -e "╚═══════════════════════════════════════════╝"
 echo -e "                                 ${DGRAY}by StressOzz${NC}"
-echo
 
+echo
 check_status
-
 echo
+
 echo -e "${CYAN}1) ${GREEN}Установить ${NC}mihomo-openwrt"
 echo -e "${CYAN}2) ${GREEN}Удалить ${NC}mihomo-openwrt"
 echo -e "${CYAN}3) ${GREEN}Сменить список ${NC}MagiTrickle"
