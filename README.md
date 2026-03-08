@@ -153,4 +153,4 @@ sh <(wget -O - https://raw.githubusercontent.com/StressOzz/Mixomo-Manager/main/m
 
 # Благодарности
 
-Спасибо [Internet Helper](https://github.com/Internet-Helper/) за [Mihomo](https://github.com/Internet-Helper/mixomo-openwrt)
+Спасибо [Internet Helper](https://github.com/Internet-Helper/) за [Mixomo](https://github.com/Internet-Helper/mixomo-openwrt)
