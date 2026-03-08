@@ -1,10 +1,18 @@
 #!/bin/sh
 
-set -euo pipefail
+SCRIPT_VERSION="v0.1.2-alpha"
+
+MT_VERSION_APK="0.5.3"
+MT_PRE_APK="pre20260305232358"
+MT_VERSION_OPKG="0.5.2"
+
+MIHOMO_INSTALL_DIR="/etc/mihomo"
+MIHOMO_BIN="/usr/bin/mihomo"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -12,28 +20,48 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_step()  { echo -e "${GREEN}=== $* ===${NC}"; }
 log_done()  { echo -e "${GREEN}$*${NC}"; }
-step_ok()   { echo -e "${GREEN}[OK]${NC}"; }
 step_fail() { echo -e "${RED}[FAIL]${NC}"; exit 1; }
 
-MIHOMO_INSTALL_DIR="/etc/mihomo"
-MIHOMO_BIN="/usr/bin/mihomo"
-SCRIPT_VERSION="v0.1.0-alpha"
+USE_APK=0
+if command -v apk > /dev/null 2>&1; then
+    USE_APK=1
+fi
+
+manage_pkg() {
+    local action="$1"
+    shift
+    if [ "$USE_APK" -eq 1 ]; then
+        case "$action" in
+            update)  apk update ;;
+            install) apk add "$@" ;;
+            remove)  apk del "$@" ;;
+        esac
+    else
+        case "$action" in
+            update)  opkg update ;;
+            install) opkg install "$@" ;;
+            remove)  opkg remove "$@" ;;
+        esac
+    fi
+}
 
 detect_mihomo_arch() {
-    local arch=$(uname -m)
-    local endian_byte=$(hexdump -s 5 -n 1 -e '1/1 "%d"' /bin/busybox 2>/dev/null)
+    local arch
+    arch=$(uname -m)
+    local endian_byte
+    endian_byte=$(hexdump -s 5 -n 1 -e '1/1 "%d"' /bin/busybox 2>/dev/null || echo "0")
 
     case "$arch" in
-        x86_64)  echo "amd64" ;;
-        i?86)    echo "386" ;;
+        x86_64)        echo "amd64" ;;
+        i?86)          echo "386" ;;
         aarch64|arm64) echo "arm64" ;;
-        armv7*)  echo "armv7" ;;
+        armv7*)        echo "armv7" ;;
         armv5*|armv4*) echo "armv5" ;;
         mips*)
-            local fpu=$(grep -c "FPU" /proc/cpuinfo 2>/dev/null || echo 0)
+            local fpu
+            fpu=$(grep -c "FPU" /proc/cpuinfo 2>/dev/null || echo 0)
             local floattype="softfloat"
             [ "$fpu" -gt 0 ] && floattype="hardfloat"
-
             if [ "$endian_byte" = "1" ]; then
                 echo "mipsle-${floattype}"
             else
@@ -48,109 +76,101 @@ detect_mihomo_arch() {
     esac
 }
 
+install_deps() {
+    log_info "Установка зависимостей..."
+
+    local PKG_LOG="/tmp/install_deps.log"
+
+    if [ "$USE_APK" -eq 1 ]; then
+        log_info "Обновление индексов пакетов (apk)..."
+        apk update > "$PKG_LOG" 2>&1 || true
+        local AVAIL_PKG
+        AVAIL_PKG=$(grep -o '[0-9]* distinct packages available' "$PKG_LOG" | grep -o '^[0-9]*')
+        if [ -z "$AVAIL_PKG" ] || [ "$AVAIL_PKG" -eq 0 ]; then
+            log_warn "apk update не вернул доступных пакетов, повторная попытка..."
+            sleep 3
+            apk update > "$PKG_LOG" 2>&1 || true
+            AVAIL_PKG=$(grep -o '[0-9]* distinct packages available' "$PKG_LOG" | grep -o '^[0-9]*')
+            if [ -z "$AVAIL_PKG" ] || [ "$AVAIL_PKG" -eq 0 ]; then
+                log_error "apk update завершился без доступных пакетов:"
+                cat "$PKG_LOG"
+                rm -f "$PKG_LOG"
+                return 1
+            fi
+        fi
+        log_info "Доступно пакетов: $AVAIL_PKG"
+        apk add wget-ssl ca-certificates kmod-tun kmod-nft-tproxy kmod-nft-nat curl >> "$PKG_LOG" 2>&1 || {
+            log_error "Ошибка установки зависимостей:"; cat "$PKG_LOG"; rm -f "$PKG_LOG"; return 1;
+        }
+    else
+        if ! opkg update > "$PKG_LOG" 2>&1; then
+            log_warn "opkg update не удался, переустановка wget..."
+            opkg remove wget-ssl >> "$PKG_LOG" 2>&1
+            opkg install wget --force-reinstall >> "$PKG_LOG" 2>&1
+            if ! opkg update >> "$PKG_LOG" 2>&1; then
+                log_error "Ошибка обновления списков пакетов:"; cat "$PKG_LOG"; rm -f "$PKG_LOG"; return 1
+            fi
+        fi
+        opkg install wget-ssl ca-certificates kmod-tun kmod-nft-tproxy kmod-nft-nat curl libcurl4 ca-bundle >> "$PKG_LOG" 2>&1 || {
+            log_error "Ошибка установки зависимостей:"
+            if grep -iq "No space left on device" "$PKG_LOG" || grep -iq "write error" "$PKG_LOG"; then
+                log_error "Недостаточно места на диске!"
+            else
+                cat "$PKG_LOG"
+            fi
+            rm -f "$PKG_LOG"; return 1
+        }
+    fi
+
+    rm -f "$PKG_LOG"
+    log_info "Зависимости установлены."
+}
+
 install_mihomo() {
-	if ! . /etc/openwrt_release 2>/dev/null; then
-		log_error "Не удалось определить версию OpenWrt"
-		return 1
-	fi
-	
-	local major="${DISTRIB_RELEASE%%.*}"
-	
-	if [ "$major" -lt 22 ] || [ "$major" -ge 25 ]; then
-		log_error "Поддерживаются только OpenWrt 22.03 - 24.x"
-		return 1
-	fi
+    local REQ_TMP_KB=16000
+    local REQ_ROOT_KB=18000
 
-	local REQ_TMP_KB=16000
-	local REQ_ROOT_KB=24000
-	local AVAIL_TMP_KB
-	AVAIL_TMP_KB=$(df -k /tmp | awk 'NR==2 {print $4}')
+    local AVAIL_TMP_KB
+    AVAIL_TMP_KB=$(df -k /tmp | awk 'NR==2 {print $4}')
+    if [ "$AVAIL_TMP_KB" -lt "$REQ_TMP_KB" ]; then
+        log_error "Недостаточно места в /tmp: доступно $((AVAIL_TMP_KB/1024)) MB, требуется $((REQ_TMP_KB/1024)) MB"
+        return 1
+    fi
 
-	if [ "$AVAIL_TMP_KB" -lt "$REQ_TMP_KB" ]; then
-		log_error "Ошибка: недостаточно места в /tmp (RAM) для скачивания архива!"
-		log_error "Доступно: $((AVAIL_TMP_KB/1024)) MB, Требуется: $((REQ_TMP_KB/1024)) MB"
-		return 1
-	fi
+    local INSTALL_DIR_PATH
+    INSTALL_DIR_PATH=$(dirname "$MIHOMO_BIN")
+    local AVAIL_ROOT_KB
+    AVAIL_ROOT_KB=$(df -k "$INSTALL_DIR_PATH" | awk 'NR==2 {print $4}')
 
-	local INSTALL_DIR_PATH
-	INSTALL_DIR_PATH=$(dirname "$MIHOMO_BIN")
-
-	local AVAIL_ROOT_KB
-	AVAIL_ROOT_KB=$(df -k "$INSTALL_DIR_PATH" | awk 'NR==2 {print $4}')
-
-	if [ "$AVAIL_ROOT_KB" -lt "$REQ_ROOT_KB" ]; then
-		log_error "Ошибка: недостаточно места на диске для установки ядра!"
-		log_error "Доступно: $((AVAIL_ROOT_KB/1024)) MB, Требуется: $((REQ_ROOT_KB/1024)) MB"
-		
-		if [ -f "$MIHOMO_BIN" ]; then
-			log_warn "Обнаружена установленная версия ядра: $MIHOMO_BIN"
-			
-			echo -n "Удалить старую версию для освобождения места? [y/+/д или N/-/н]: "
-			read -r response
-			
-			case "$response" in
-				[yY+дД]*)
-					log_info "Удаление старой версии..."
-					rm -f "$MIHOMO_BIN"
-					
-					AVAIL_ROOT_KB=$(df -k "$INSTALL_DIR_PATH" | awk 'NR==2 {print $4}')
-					
-					if [ "$AVAIL_ROOT_KB" -lt "$REQ_ROOT_KB" ]; then
-						log_error "Место всё равно не хватает после удаления старой версии!"
-						log_error "Доступно: $((AVAIL_ROOT_KB/1024)) MB, Требуется: $((REQ_ROOT_KB/1024)) MB"
-						log_warn "Удалите другие ненужные пакеты или файлы вручную."
-						return 1
-					else
-						log_info "Места теперь достаточно. Продолжаем установку..."
-						log_info "Доступно на диске: $((AVAIL_ROOT_KB/1024)) MB"
-					fi
-					;;
-				*)
-					log_warn "Установка отменена пользователем."
-					log_warn "Совет: удалите ненужные пакеты или старую версию вручную перед установкой."
-					return 1
-					;;
-			esac
-		else
-			log_warn "Старая версия не найдена. Удалите ненужные пакеты вручную."
-			return 1
-		fi
-	else
-		log_info "Свободного места достаточно для дальнейшей установки."
-	fi
+    if [ "$AVAIL_ROOT_KB" -lt "$REQ_ROOT_KB" ]; then
+        log_error "Недостаточно места на диске: доступно $((AVAIL_ROOT_KB/1024)) MB, требуется $((REQ_ROOT_KB/1024)) MB"
+        if [ -f "$MIHOMO_BIN" ]; then
+            log_warn "Найдена установленная версия: $MIHOMO_BIN"
+            printf "Удалить старую версию для освобождения места? [y/+/д или n/-/н]: "
+            read -r response
+            case "$response" in
+                [yY+дД]*)
+                    rm -f "$MIHOMO_BIN"
+                    AVAIL_ROOT_KB=$(df -k "$INSTALL_DIR_PATH" | awk 'NR==2 {print $4}')
+                    if [ "$AVAIL_ROOT_KB" -lt "$REQ_ROOT_KB" ]; then
+                        log_error "Места всё равно недостаточно после удаления."
+                        return 1
+                    fi
+                    ;;
+                *)
+                    log_warn "Установка отменена."
+                    return 1
+                    ;;
+            esac
+        else
+            log_warn "Старая версия не найдена. Удалите лишние пакеты вручную."
+            return 1
+        fi
+    fi
 
     if [ -f "/etc/init.d/mihomo" ]; then
         /etc/init.d/mihomo stop 2>/dev/null || true
     fi
-
-    echo "--> Обновление списков пакетов и установка необходимых зависимостей..."
-    
-    local PKG_LOG="/tmp/mihomo_install.log"
-
-    if ! opkg update > "$PKG_LOG" 2>&1; then
-        log_error "Ошибка при обновлении списков пакетов (opkg update)!"
-        cat "$PKG_LOG"
-        rm -f "$PKG_LOG"
-        step_fail
-    fi
-
-    if ! opkg install kmod-nft-tproxy kmod-tun curl libcurl4 ca-bundle ca-certificates > "$PKG_LOG" >/dev/null 2>&1; then
-        log_error "Ошибка при установке пакетов!"
-        
-        if grep -iq "No space left on device" "$PKG_LOG" || grep -iq "write error" "$PKG_LOG"; then
-            echo ""
-            log_error "Недостаточно места на диске!"
-            log_warn "Попробуйте удалить лишние пакеты или сделать сброс роутера."
-            echo ""
-        else
-            cat "$PKG_LOG"
-        fi
-        
-        rm -f "$PKG_LOG"
-        step_fail
-    fi
-
-    rm -f "$PKG_LOG"
 
     if [ -z "${MIHOMO_ARCH+x}" ]; then
         MIHOMO_ARCH=$(detect_mihomo_arch)
@@ -158,30 +178,29 @@ install_mihomo() {
     echo "--> Архитектура системы: $(uname -m) -> выбран файл: $MIHOMO_ARCH"
 
     mkdir -p "$MIHOMO_INSTALL_DIR" \
-			 /etc/mihomo/proxy-providers \
-			 /etc/mihomo/rule-providers \
+             /etc/mihomo/proxy-providers \
+             /etc/mihomo/rule-providers \
              /etc/mihomo/rule-files \
              /etc/mihomo/UI
 
     echo "$MIHOMO_ARCH" > /etc/mihomo/.arch
 
     echo "--> Получение номера последней версии..."
+    local RELEASE_TAG
     RELEASE_TAG=$(curl -Ls -o /dev/null -w '%{url_effective}' https://github.com/MetaCubeX/mihomo/releases/latest | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    
     if [ -z "$RELEASE_TAG" ]; then
         log_error "Не удалось определить версию. Проверьте интернет."
         return 1
     fi
     echo "--> Последняя версия: $RELEASE_TAG"
 
-    FILENAME="mihomo-linux-${MIHOMO_ARCH}-${RELEASE_TAG}.gz"
-    DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/download/${RELEASE_TAG}/${FILENAME}"
-    TMP_FILE="/tmp/mihomo.gz"
+    local FILENAME="mihomo-linux-${MIHOMO_ARCH}-${RELEASE_TAG}.gz"
+    local DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/download/${RELEASE_TAG}/${FILENAME}"
+    local TMP_FILE="/tmp/mihomo.gz"
 
     log_info "Скачивание архива $FILENAME"
     echo "--> URL: $DOWNLOAD_URL"
-
-    if ! curl -Lf --retry 3 --retry-delay 2 "$DOWNLOAD_URL" -o "$TMP_FILE" >/dev/null 2>&1; then
+    if ! curl -Lf --retry 3 --retry-delay 2 "$DOWNLOAD_URL" -o "$TMP_FILE"; then
         log_error "Ошибка скачивания! Проверьте, существует ли файл $FILENAME в релизах."
         return 1
     fi
@@ -192,40 +211,95 @@ install_mihomo() {
         rm -f "$TMP_FILE"
         return 1
     fi
-
     chmod +x "$MIHOMO_BIN"
     rm -f "$TMP_FILE"
 
     echo "--> Проверка работы ядра Mihomo..."
     if ! "$MIHOMO_BIN" -v >/dev/null 2>&1; then
-        log_error "Ядро скачано, но не запускается! Возможно, выбрана неверная архитектура (например, hardfloat вместо softfloat)."
+        log_error "Ядро не запускается! Возможно, выбрана неверная архитектура."
         return 1
     fi
 
-	chmod +x /usr/bin/mihomo || return 1
-
-	local CONFIG_FILE="/etc/mihomo/config.yaml"
+    local CONFIG_FILE="/etc/mihomo/config.yaml"
     local WRITE_NEW_CONFIG=1
 
     if [ -f "$CONFIG_FILE" ]; then
         if grep -q "mixed-port: 7890" "$CONFIG_FILE"; then
-            echo "--> Найдена существующая конфигурация с корректным портом (mixed-port: 7890)"
-            echo "--> Оставляем текущую конфигурацию без изменений..."
+            echo "--> Найдена существующая конфигурация. Оставляем без изменений..."
             WRITE_NEW_CONFIG=0
         else
-            log_warn "Найдена конфигурация, но в ней нет 'mixed-port: 7890'."
-            log_info "Предыдущая конфигурация сохранена в ${CONFIG_FILE}.bak чтобы использовать новую."
+            log_warn "Конфигурация найдена, но без 'mixed-port: 7890'. Создаём резервную копию."
             cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
         fi
     fi
 
     if [ "$WRITE_NEW_CONFIG" -eq 1 ]; then
         echo "--> Создание новой конфигурации /etc/mihomo/config.yaml..."
-        > "$CONFIG_FILE"
+        cat > "$CONFIG_FILE" <<'EOF'
+mode: rule
+ipv6: false
+mixed-port: 7890
+log-level: error
+allow-lan: false
+unified-delay: true
+tcp-concurrent: false
+find-process-mode: off
+external-controller: 0.0.0.0:9090
+external-ui: ./UI
+external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"
+routing-mark: 2
+profile:
+  store-selected: true
+  store-fake-ip: true
+  tracing: true
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - Mijia Cloud
+    - +.lan
+    - +.local
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+    - +.3gppnetwork.org
+    - +.openwrt.org
+    - +.vsean.net
+    - cudy.net
+
+dns:
+  enable: true
+  listen: 0.0.0.0:7880
+  ipv6: false
+  nameserver:
+    - https://dns.google/dns-query
+    - https://dns.cloudflare.com/dns-query
+    - https://common.dot.dns.yandex.net/dns-query
+    - https://unfiltered.adguard-dns.com/dns-query
+
+proxies:
+  - name: Домашний интернет
+    type: direct
+
+proxy-groups:
+
+rule-providers:
+
+rules:
+  - MATCH,Домашний интернет
+EOF
     fi
-	
-	echo "--> Создание службы /etc/init.d/mihomo..."
-	cat > /etc/init.d/mihomo <<'EOF' || return 1
+
+    echo "--> Создание службы /etc/init.d/mihomo..."
+    cat > /etc/init.d/mihomo <<'EOF'
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=1
@@ -237,13 +311,12 @@ MIHOMO_CONF="/etc/mihomo/config.yaml"
 start_service() {
     [ -x "$MIHOMO_BIN" ] || return 1
     [ -s "$MIHOMO_CONF" ] || return 1
-    
+
     procd_open_instance "main"
     procd_set_param command "$MIHOMO_BIN" -d "$MIHOMO_DIR" -f "$MIHOMO_CONF"
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param respawn
-    
     procd_close_instance
 }
 
@@ -251,123 +324,109 @@ service_triggers() {
     procd_add_reload_trigger "mihomo"
 }
 EOF
-	chmod +x /etc/init.d/mihomo || return 1
+    chmod +x /etc/init.d/mihomo
+    /etc/init.d/mihomo enable || log_warn "Не удалось включить автозапуск"
 
-	echo "--> Включение автозапуска Mihomo..."
-	/etc/init.d/mihomo enable || log_warn "Не удалось включить автозапуск"
-
-	echo "--> Настройка страницы LuCI для управления Mihomo..."
-	mkdir -p /usr/share/luci/menu.d || return 1
-	cat > /usr/share/luci/menu.d/luci-app-mihomo.json <<'EOF' || return 1
+    echo "--> Настройка страницы LuCI для управления Mihomo..."
+    mkdir -p /usr/share/luci/menu.d
+    cat > /usr/share/luci/menu.d/luci-app-mihomo.json <<'EOF'
 {
-	"admin/services/mihomo": {
-		"title": "Mihomo",
-		"order": 60,
-		"action": { "type": "view", "path": "mihomo/config" },
-		"depends": { "acl": [ "luci-app-mihomo" ] }
-	}
+    "admin/services/mihomo": {
+        "title": "Mihomo",
+        "order": 60,
+        "action": { "type": "view", "path": "mihomo/config" },
+        "depends": { "acl": [ "luci-app-mihomo" ] }
+    }
 }
 EOF
 
-	mkdir -p /usr/share/rpcd/acl.d || return 1
-	cat > /usr/share/rpcd/acl.d/luci-app-mihomo.json <<'EOF' || return 1
+    mkdir -p /usr/share/rpcd/acl.d
+    cat > /usr/share/rpcd/acl.d/luci-app-mihomo.json <<'EOF'
 {
-	"luci-app-mihomo": {
-		"description": "Mihomo control",
-		"read": {
-			"file": {
-				"/etc/mihomo/config.yaml": ["read"],
-				"/etc/mihomo/rule-files/": ["list"],
-				"/etc/mihomo/rule-files/*": ["read"]
-			},
-			"ubus": {
-				"file": ["read", "list"],
-				"service": ["list"]
-			}
-		},
-		"write": {
-			"file": {
-				"/etc/mihomo/config.yaml": ["write"],
-				"/etc/mihomo/rule-files/*": ["write"],
-				"/usr/bin/mihomo": ["exec"],
-				"/etc/init.d/mihomo": ["exec"],
-				"/sbin/logread": ["exec"],
-				"/bin/sh": ["exec"],
-				"/bin/ash": ["exec"],
-				"/usr/bin/curl": ["exec"],
-				"/usr/bin/wget": ["exec"],
-				"/bin/gzip": ["exec"],
-				"/bin/chmod": ["exec"],
-				"/bin/mv": ["exec"],
-				"/bin/rm": ["exec"]
-			},
-			"ubus": {
-				"file": ["write"],
-				"service": ["list"]
-			}
-		}
-	}
+    "luci-app-mihomo": {
+        "description": "Mihomo control",
+        "read": {
+            "file": {
+                "/etc/mihomo/config.yaml": ["read"],
+                "/etc/mihomo/rule-files/": ["list"],
+                "/etc/mihomo/rule-files/*": ["read"]
+            },
+            "ubus": {
+                "file": ["read", "list"],
+                "service": ["list"]
+            }
+        },
+        "write": {
+            "file": {
+                "/etc/mihomo/config.yaml": ["write"],
+                "/etc/mihomo/rule-files/*": ["write"],
+                "/usr/bin/mihomo": ["exec"],
+                "/etc/init.d/mihomo": ["exec"],
+                "/sbin/logread": ["exec"],
+                "/bin/sh": ["exec"],
+                "/bin/ash": ["exec"],
+                "/usr/bin/curl": ["exec"],
+                "/usr/bin/wget": ["exec"],
+                "/bin/gzip": ["exec"],
+                "/bin/chmod": ["exec"],
+                "/bin/mv": ["exec"],
+                "/bin/rm": ["exec"]
+            },
+            "ubus": {
+                "file": ["write"],
+                "service": ["list"]
+            }
+        }
+    }
 }
 EOF
 
     local VIEW_PATH="/www/luci-static/resources/view/mihomo"
     local ACE_PATH="$VIEW_PATH/ace"
-    
-    mkdir -p "$ACE_PATH" || return 1
+    mkdir -p "$ACE_PATH"
 
     echo "--> Определение последней версии ACE Editor..."
-    
     local LATEST_ACE_VER
     LATEST_ACE_VER=$(curl -s "https://api.cdnjs.com/libraries/ace" | grep -o '"version":"[^"]*"' | cut -d'"' -f4 | head -1)
-
     if [ -z "$LATEST_ACE_VER" ]; then
-        log_warn "Не удалось получить версию через API, используем фиксированную версию"
+        log_warn "cdnjs API недоступен, пробуем GitHub API..."
+        LATEST_ACE_VER=$(curl -s "https://api.github.com/repos/ajaxorg/ace/releases/latest" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^v//' | head -1)
+    fi
+    if [ -z "$LATEST_ACE_VER" ]; then
+        log_warn "Используем фиксированную версию ACE Editor"
         LATEST_ACE_VER="1.43.3"
     else
-        echo "--> Последния версия: $LATEST_ACE_VER"
+        echo "--> Актуальная версия ACE: $LATEST_ACE_VER"
     fi
 
-    log_info  "Скачивание ACE Editor $LATEST_ACE_VER..."
-    
-    local CDN_BASE="https://cdnjs.cloudflare.com/ajax/libs/ace/${LATEST_ACE_VER}"
-    
-    for file in ace.min.js theme-merbivore_soft.min.js theme-tomorrow.min.js mode-yaml.min.js worker-yaml.min.js; do
-        local target_name=$(echo "$file" | sed 's/\.min\.js$/.js/')
-        local dest="${ACE_PATH}/${target_name}"
-        
-        local attempt=1
-        local max_attempts=2
+    log_info "Скачивание файлов ACE Editor $LATEST_ACE_VER..."
+    for file in ace.js theme-merbivore_soft.js theme-tomorrow.js mode-yaml.js worker-yaml.js; do
+        local dest="${ACE_PATH}/${file}"
         local success=0
+        local URL_CDNJS="https://cdnjs.cloudflare.com/ajax/libs/ace/${LATEST_ACE_VER}/${file}"
+        local URL_JSDELIVR="https://cdn.jsdelivr.net/npm/ace-builds@${LATEST_ACE_VER}/src-min-noconflict/${file}"
+        local URL_GITHUB="https://raw.githubusercontent.com/ajaxorg/ace-builds/master/src-min-noconflict/${file}"
 
-        while [ $attempt -le $max_attempts ]; do
-            if ! curl -Lf -s -o "$dest" "${CDN_BASE}/${file}"; then
-                if ! wget -q -O "$dest" "${CDN_BASE}/${file}"; then
-                    true 
+        for download_url in "$URL_CDNJS" "$URL_JSDELIVR" "$URL_GITHUB"; do
+            if curl -Lf -s -o "$dest" "$download_url" || wget -q -O "$dest" "$download_url"; then
+                if [ -s "$dest" ]; then
+                    success=1
+                    break
                 fi
             fi
-
-            if [ -s "$dest" ]; then
-                success=1
-                break
-            else
-                rm -f "$dest"
-                if [ $attempt -lt $max_attempts ]; then
-                    log_warn "Файл $target_name скачался пустым или возникла ошибка. Повторная попытка..."
-                    sleep 1
-                fi
-            fi
-            
-            attempt=$((attempt + 1))
+            [ -f "$dest" ] && rm -f "$dest"
         done
 
-        if [ $success -eq 0 ]; then
-            log_error "Не удалось скачать $file после $max_attempts попыток."
+        if [ "$success" -eq 1 ]; then
+            echo "--> Скачан файл $file"
+        else
+            log_error "Не удалось скачать $file ни из одного источника."
             return 1
         fi
     done
 
-	echo "--> Создание config.js..."
-	cat > "$VIEW_PATH/config.js" <<'EOF' || return 1
+    echo "--> Создание config.js..."
+    cat > "$VIEW_PATH/config.js" <<'EOF'
 'use strict';
 'require view';
 'require fs';
@@ -500,9 +559,11 @@ return view.extend({
         this.latestVersion = latestVersion;
 
         if (this.latestVersionEl) {
-            this.latestVersionEl.textContent = _('[актуальная: %s]').format(latestVersion);
+            this.latestVersionEl.textContent = _('(актуальное ядро %s)').format(latestVersion.replace('v', ''));
             this.latestVersionEl.style.display = 'inline';
-            this.latestVersionEl.style.color = (latestVersion !== currentVersion) ? '#5cb85c' : '#888';
+            // Используем стандартный зеленый через opacity/filter или оставляем для привлечения внимания
+            this.latestVersionEl.style.color = (latestVersion !== currentVersion) ? '#5cb85c' : '';
+            this.latestVersionEl.style.opacity = (latestVersion !== currentVersion) ? '1' : '0.6';
         }
 
         if (latestVersion === currentVersion) {
@@ -621,21 +682,27 @@ return view.extend({
         cachedRuleFiles = (data[2] || []).sort(function(a, b) { return a.name.localeCompare(b.name); });
         var isRunning = !!(serviceInfo.mihomo && serviceInfo.mihomo.instances.main.running);
         
-        var versionContainer = E('span', { 'id': 'mihomo-version', 'style': 'margin-left: 10px; font-size: 12px; color: #888;' }, _('Загрузка...'));
-        var latestVersionEl = E('span', { 'id': 'mihomo-latest-version', 'style': 'margin-left: 4px; font-size: 12px; color: #888; display: none;' }, '');
+        var versionContainer = E('span', { 'id': 'mihomo-version', 'style': 'margin-left: 10px; font-size: 0.9em; opacity: 0.7;' }, _('Загрузка...'));
+        var latestVersionEl = E('span', { 'id': 'mihomo-latest-version', 'style': 'margin-left: 4px; font-size: 0.9em; opacity: 0.7; display: none;' }, '');
         this.latestVersionEl = latestVersionEl;
-        var updateButton = E('button', { 'id': 'mihomo-update-btn', 'class': 'btn cbi-button-neutral', 'style': 'margin-left: 10px; padding: 0 8px;', 'disabled': true }, _('Проверить обновление'));
+        var updateButton = E('button', { 'id': 'mihomo-update-btn', 'class': 'btn cbi-button-neutral', 'style': 'margin-left: 10px; padding: 0 0.6em; font-size: 0.9em;', 'disabled': true }, _('Проверить обновление'));
         this.updateButton = updateButton;
         
         var statusBadge = isRunning 
-            ? E('span', { 'class': 'badge', 'style': 'font-size: 13px; font-weight: bold; padding: 6px 14px; margin-left: 14px; border-radius: 8px; background-color: #5cb85c; color: #F8F8F8;' }, _('работает'))
-            : E('span', { 'class': 'badge', 'style': 'font-size: 13px; font-weight: bold; padding: 6px 14px; margin-left: 14px; border-radius: 6px; background-color: #888; color: #F8F8F8;' }, _('остановлен'));
+            ? E('span', { 
+                'class': 'label success', 
+                'style': 'margin-left: 14px; font-size: 0.85em; min-height: 1.7rem; padding: 0 1.9em; display: inline-flex; align-items: center; vertical-align: middle;' 
+            }, _('работает'))
+            : E('span', { 
+                'class': 'label', 
+                'style': 'margin-left: 14px; font-size: 0.85em; min-height: 1.7rem; padding: 0 1.9em; display: inline-flex; align-items: center; vertical-align: middle;' 
+            }, _('остановлен'));
         
         var serviceButton = isRunning
-            ? E('button', { 'class': 'btn cbi-button-reset', 'style': 'margin-left: 16px; padding: 0 12px;', 'click': ui.createHandlerFn(this, 'handleServiceAction', 'stop') }, _('Остановить'))
-            : E('button', { 'class': 'btn cbi-button-action', 'style': 'margin-left: 16px; padding: 0 12px; border-color: #5cb85c; color: #5cb85c;', 'click': ui.createHandlerFn(this, 'handleServiceAction', 'start') }, _('Запустить'));
+            ? E('button', { 'class': 'btn cbi-button-reset', 'style': 'margin-left: 16px;', 'click': ui.createHandlerFn(this, 'handleServiceAction', 'stop') }, _('Остановить'))
+            : E('button', { 'class': 'btn cbi-button-positive btn-save-custom', 'style': 'margin-left: 16px;', 'click': ui.createHandlerFn(this, 'handleServiceAction', 'start') }, _('Запустить'));
         
-        var header = E('div', { 'style': 'display: flex; align-items: center; margin-bottom: 16px; flex-wrap: wrap;' }, [
+        var header = E('div', { 'style': 'display: flex; align-items: center; margin-bottom: 1rem; flex-wrap: wrap;' }, [
             E('h2', { 'style': 'margin: 0;' }, _('Mihomo')), 
             statusBadge, 
             serviceButton, 
@@ -648,7 +715,7 @@ return view.extend({
         this.getMihomoVersion().then(function(version) {
             self.currentVersion = version;
             var versionEl = document.getElementById('mihomo-version');
-            if (versionEl) versionEl.textContent = _('%s').format(version);
+            if (versionEl) versionEl.textContent = _('%s').format(version.replace('v', ''));
             var updateBtn = document.getElementById('mihomo-update-btn');
             if (updateBtn) {
                 updateBtn.disabled = false;
@@ -689,19 +756,32 @@ return view.extend({
         `;
 
         var style = E('style', {}, cssVariables + `
+            .btn, .cbi-button {
+                min-height: 1.8rem !important; 
+                display: inline-flex !important;
+                align-items: center;
+                justify-content: center;
+                vertical-align: middle;
+                box-sizing: border-box !important; /* Чтобы padding не раздувал кнопку */
+                padding: 0 1rem !important;
+                line-height: 1 !important;
+            }
+            #output-text {
+                font-size: 0.8rem !important;
+            }
             .cbi-page-actions { display: none !important; }
-            .custom-actions { display: flex; gap: 8px; }
+            .custom-actions { display: flex; gap: 0.5rem; }
             .tab-bar { display: flex; flex-wrap: nowrap; background-color: var(--bg-tab); }
-            .tab-item { display: flex; align-items: center; padding: 8px 15px; cursor: pointer; background-color: var(--bg-tab); color: var(--text-dim); margin-right: 1px; font-size: 13px; border-top: 1px solid transparent; white-space: nowrap; user-select: none; box-sizing: border-box }
+            .tab-item { display: flex; align-items: center; padding: 0.6em 1.2em; cursor: pointer; background-color: var(--bg-tab); color: var(--text-dim); margin-right: 1px; font-size: 0.9em; border-top: 1px solid transparent; white-space: nowrap; user-select: none; box-sizing: border-box }
             .tab-item:hover { background-color: var(--bg-toolbar); color: var(--text-main); }
             .tab-item.active { background-color: var(--bg-tab-active); color: var(--text-main); border: 1px solid var(--border-active); }
-            .tab-close { margin-left: 8px; border-radius: 3px; padding: 0 4px; color: #999; font-weight: bold; }
+            .tab-close { margin-left: 0.6em; border-radius: 3px; padding: 0 0.3em; color: #999; font-weight: bold; }
             .tab-close:hover { background-color: #c0392b; color: white; }
-            .tab-new { font-weight: bold; font-size: 16px; padding: 8px 12px; }
-            .toolbar { background-color: var(--bg-toolbar); border: 1px solid var(--border-color); padding: 10px; color: var(--text-main); }
-            .toolbar-row { display: flex; gap: 10px; align-items: center; }
-            .toolbar textarea { width: 100%; height: 70px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); font-family: monospace; font-size: 12px; padding: 5px; }
-            .toolbar select { background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); padding: 5px; }
+            .tab-new { font-weight: bold; font-size: 1.2em; padding: 0.5em 0.8em; }
+            .toolbar { background-color: var(--bg-toolbar); border: 1px solid var(--border-color); padding: 0.8rem; color: var(--text-main); }
+            .toolbar-row { display: flex; gap: 0.8rem; align-items: center; }
+            .toolbar textarea { width: 100%; height: 6em; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); font-family: monospace; font-size: 0.9em; padding: 0.4em; }
+            .toolbar select { background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); padding: 0.4em; }
             .toolbar-col { display: flex; flex-direction: column; }
             .btn-save-custom { border-color: #5cb85c !important; color: #5cb85c !important; }
             .btn-save-custom:hover { border-color: #5cb85c !important; }
@@ -709,44 +789,44 @@ return view.extend({
             .btn.cbi-button-reset:hover { border-color: #F62B12 !important; color: #F62B12 !important; }
             .btn-generate { border-color: #5cb85c !important; color: #5cb85c !important; margin: auto 0; display: block; background: var(--bg-input); }
             .btn-generate:hover { border-color: #5cb85c !important; }
-            .snippet-container { margin-top: 0; border: 1px solid var(--border-color); background: var(--bg-toolbar); padding: 10px; display: none; }
-            .snippet-header { margin-bottom: 5px; color: var(--text-main); font-size: 12px; }
-            .snippet-text { width: 100%; height: 115px; background: var(--bg-tab-active); color: var(--text-main); border: 1px solid var(--border-color); font-family: monospace; font-size: 12px; padding: 10px; resize: none; }
-            .output-box-close { background: transparent; border: none; color: var(--text-main); font-size: 22px; line-height: 1; cursor: pointer; margin-left: 15px; padding: 0 5px; }
+            .snippet-container { margin-top: 0; border: 1px solid var(--border-color); background: var(--bg-toolbar); padding: 0.8rem; display: none; }
+            .snippet-header { margin-bottom: 0.4rem; color: var(--text-main); font-size: 0.85em; }
+            .snippet-text { width: 100%; height: 9.5em; background: var(--bg-tab-active); color: var(--text-main); border: 1px solid var(--border-color); font-family: monospace; font-size: 0.9em; padding: 0.8em; resize: none; }
+            .output-box-close { background: transparent; border: none; color: var(--text-main); font-size: 1.5em; line-height: 1; cursor: pointer; margin-left: 1rem; padding: 0 0.4rem; }
             .output-box-close:hover { color: #e74c3c !important; }
-			#ace_editor_container { width: 100%; height: 700px; border: 1px solid var(--border-color); border-top: none; }
+			#ace_editor_container { width: 100%; height: 60vh; border: 1px solid var(--border-color); border-top: none; }
         `);
         
         var tabBar = E('div', { 'id': 'mihomo-tab-bar', 'class': 'tab-bar' });
         var toolbarContainer = E('div', { 'id': 'mihomo-toolbar' });
         var editorContainer = E('div', { 'id': 'ace_editor_container' });
         
-        var snippetContainer = E('div', { 'id': 'snippet-box', 'class': 'snippet-container', 'style': 'margin-top: 10px' }, [
-            E('div', { 'class': 'snippet-header', 'style': 'color: var(--text-dim)' }, _('Чтобы Mihomo увидел файл, добавьте эту секцию в rule-providers:')),
-            E('textarea', { 'id': 'snippet-area', 'class': 'snippet-text', 'readonly': 'readonly', 'style': 'color: var(--text-dim)' }),
-            E('div', { 'style': 'margin-top: 10px; display: flex; gap: 10px;' }, [
+        var snippetContainer = E('div', { 'id': 'snippet-box', 'class': 'snippet-container', 'style': 'margin-top: 0.8rem' }, [
+            E('div', { 'class': 'snippet-header', 'style': 'opacity: 0.7' }, _('Чтобы Mihomo увидел файл, добавьте эту секцию в rule-providers:')),
+            E('textarea', { 'id': 'snippet-area', 'class': 'snippet-text', 'readonly': 'readonly', 'style': 'opacity: 0.8' }),
+            E('div', { 'style': 'margin-top: 0.8rem; display: flex; gap: 0.6rem;' }, [
                 E('button', { 'class': 'btn cbi-button-apply', 'click': ui.createHandlerFn(this, 'handleAutoAddSnippet') }, _('Добавить автоматически')),
                 E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.createHandlerFn(this, 'handleCopySnippet') }, _('Скопировать текст'))
             ])
         ]);
         
-        var buttonContainer = E('div', { 'id': 'bottom-buttons', 'class': 'custom-actions', 'style': 'margin-top: 15px;' }, [
+        var buttonContainer = E('div', { 'id': 'bottom-buttons', 'class': 'custom-actions', 'style': 'margin-top: 1rem;' }, [
             E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.createHandlerFn(this, 'handleCheck') }, _('Проверить конфигурацию')),
             E('button', { 'class': 'btn cbi-button-positive btn-save-custom', 'click': ui.createHandlerFn(this, 'handleSaveAndApply', isRunning) }, _('Сохранить')),
             E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.createHandlerFn(this, 'handleOpenDashboard', mainConfigContent) }, _('Открыть панель управления')),
             E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.createHandlerFn(this, 'handleShowLogs') }, _('Показать журнал'))
         ]);
         
-        var middleActions = E('div', { 'id': 'middle-actions', 'style': 'display: none; margin-top: 10px;' }, [
+        var middleActions = E('div', { 'id': 'middle-actions', 'style': 'display: none; margin-top: 0.8rem;' }, [
             E('button', { 'class': 'btn cbi-button-positive btn-save-custom', 'click': ui.createHandlerFn(this, 'handleSaveAndApply', isRunning) }, _('Сохранить'))
         ]);
         
-        var outputBox = E('div', { 'id': 'output-box', 'style': 'display: none; margin-top: 20px; border: 1px solid #444; border-radius: 4px; overflow: hidden;' }, [
-            E('div', { 'style': 'background: var(--bg-output-header); color: var(--text-output); padding: 8px 12px; border-bottom: 1px solid #444; display: flex; align-items: center;' }, [
-                E('strong', {}, _('Вывод:')),
+        var outputBox = E('div', { 'id': 'output-box', 'style': 'display: none; margin-top: 1.2rem; border: 1px solid var(--border-color); border-radius: 4px; overflow: hidden;' }, [
+            E('div', { 'style': 'background: var(--bg-output-header); color: var(--text-output); padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border-color); display: flex; align-items: center;' }, [
+                E('strong', { 'style': 'font-size: 0.9em' }, _('Вывод:')),
                 E('button', { 'class': 'output-box-close', 'click': function() { document.getElementById('output-box').style.display = 'none'; } }, '×')
             ]),
-            E('pre', { 'id': 'output-text', 'style': 'margin: 0; padding: 15px; background: var(--bg-output); color: var(--text-output); font-family: monospace; font-size: 12px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto;' }, '')
+            E('pre', { 'id': 'output-text', 'style': 'margin: 0; padding: 1rem; background: var(--bg-output); color: var(--text-output); font-family: monospace; font-size: 1em; white-space: pre-wrap; word-wrap: break-word; max-height: 25rem; overflow-y: auto;' }, '')
         ]);
         
         loadScript(ACE_DIR + 'ace.js').then(function() {
@@ -756,7 +836,7 @@ return view.extend({
             editor.setTheme(theme);
             editor.session.setMode("ace/mode/yaml");
             editor.setOptions({ 
-				fontSize: "13px", 
+				fontSize: "0.95em", 
 				showPrintMargin: false, 
 				wrap: true, 
 				tabSize: 2, 
@@ -863,15 +943,15 @@ return view.extend({
             
 			var row = E('div', { 'class': 'toolbar-row' }, [
 				E('div', { 'style': 'flex-grow: 1;' }, input),
-				E('div', { 'class': 'toolbar-col', 'style': 'min-width: 150px; display: flex; flex-direction: column; justify-content: space-between;' }, [
-					E('label', { 'for': 'suffixCheck', 'style': 'align-self: flex-start;' }, [ suffixCheck, ' Дублировать с точкой (.)' ]),
-					E('button', { 'class': 'btn btn-generate', 'style': 'align-self: center;', 'click': function() { self.handleAppendList(input.value, suffixCheck.checked); input.value = ''; } }, _('Добавить в список'))
+				E('div', { 'class': 'toolbar-col', 'style': 'min-width: 10rem; display: flex; flex-direction: column; justify-content: space-between;' }, [
+					E('label', { 'for': 'suffixCheck', 'style': 'align-self: flex-start; font-size: 0.85em;' }, [ suffixCheck, ' . (дубликаты с точкой)' ]),
+					E('button', { 'class': 'btn btn-generate', 'style': 'align-self: center;', 'click': function() { self.handleAppendList(input.value, suffixCheck.checked); input.value = ''; } }, _('Добавить'))
 				])
 			]);
             container.appendChild(row);
         } else {
             var input = E('textarea', { 'placeholder': 'google.com\n104.28.0.0/16\n*.example.com' });
-            var typeSelect = E('select', {}, [
+            var typeSelect = E('select', { 'style': 'font-size: 0.9em' }, [
                 E('option', { 'value': 'Auto' }, 'Auto'),
                 E('option', { 'value': 'DOMAIN-SUFFIX' }, 'DOMAIN-SUFFIX'),
                 E('option', { 'value': 'DOMAIN' }, 'DOMAIN'),
@@ -883,8 +963,8 @@ return view.extend({
             var row = E('div', { 'class': 'toolbar-row' }, [
                 E('div', { 'style': 'flex-grow: 1;' }, input),
                 E('div', { 'class': 'toolbar-col' }, [ typeSelect ]),
-                E('div', { 'class': 'toolbar-col', 'style': 'min-width: 120px; justify-content: flex-end;' }, [
-                    E('button', { 'class': 'btn btn-generate', 'click': function() { self.handleGenerateRules(input.value, typeSelect.value); input.value = ''; } }, _('Сгенерировать'))
+                E('div', { 'class': 'toolbar-col', 'style': 'min-width: 8rem; justify-content: flex-end;' }, [
+                    E('button', { 'class': 'btn btn-generate', 'click': function() { self.handleGenerateRules(input.value, typeSelect.value); input.value = ''; } }, _('Создать'))
                 ])
             ]);
             container.appendChild(row);
@@ -993,12 +1073,12 @@ return view.extend({
     
     handleCreateFile: function() {
         var self = this;
-        var nameInput = E('input', { 'type': 'text', 'style': 'width: 100%;', 'placeholder': 'my-life_my-rules' });
+        var nameInput = E('input', { 'type': 'text', 'style': 'width: 100%;', 'placeholder': 'my-rules' });
         var typeSelect = E('select', { 'style': 'width: 100%;' }, [
             E('option', { 'value': '.yaml' }, 'Набор правил (.yaml)'),
             E('option', { 'value': '.txt' }, 'Простой список (.txt)')
         ]);
-        var footer = E('div', { 'class': 'right', 'style': 'margin-top: 20px;' }, [
+        var footer = E('div', { 'class': 'right', 'style': 'margin-top: 1.5rem;' }, [
             E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Отмена')), ' ',
             E('button', { 'class': 'btn cbi-button-positive btn-save-custom', 'click': function() {
                 var filename = nameInput.value.trim();
@@ -1018,8 +1098,8 @@ return view.extend({
         ]);
         ui.showModal(_('Новый файл правил'), [
             E('div', {}, [
-                E('div', { 'style': 'display: flex; align-items: center; margin-bottom: 10px;' }, [ E('label', { 'style': 'min-width: 180px; margin-right: 10px;' }, _('Имя файла:')), nameInput ]),
-                E('div', { 'style': 'display: flex; align-items: center;' }, [ E('label', { 'style': 'min-width: 180px; margin-right: 10px;' }, _('Тип файла:')), typeSelect ])
+                E('div', { 'style': 'display: flex; align-items: center; margin-bottom: 0.8rem;' }, [ E('label', { 'style': 'min-width: 10rem; margin-right: 0.8rem;' }, _('Имя файла:')), nameInput ]),
+                E('div', { 'style': 'display: flex; align-items: center;' }, [ E('label', { 'style': 'min-width: 10rem; margin-right: 0.8rem;' }, _('Тип файла:')), typeSelect ])
             ]), footer
         ]);
         nameInput.focus();
@@ -1122,12 +1202,18 @@ EOF
 }
 
 install_hev_tunnel() {
-	log_info "Установка hev-socks5-tunnel..."
-    opkg install hev-socks5-tunnel >/dev/null 2>&1
+    log_info "Установка hev-socks5-tunnel..."
 
-    echo "--> Создание конфигурации /etc/hev-socks5-tunnel/main.yml..."
+    if [ "$USE_APK" -eq 1 ]; then
+        apk cache clean
+        apk add hev-socks5-tunnel
+    else
+        manage_pkg install hev-socks5-tunnel
+    fi
+
+    rm -f /etc/hev-socks5-tunnel/main.yml
     mkdir -p /etc/hev-socks5-tunnel
-    cat <<EOF > /etc/hev-socks5-tunnel/main.yml
+    cat > /etc/hev-socks5-tunnel/main.yml <<'EOF'
 tunnel:
   name: Mihomo
   mtu: 8500
@@ -1140,12 +1226,29 @@ socks5:
 EOF
     chmod 600 /etc/hev-socks5-tunnel/main.yml
 
-    echo "--> Очистка старых настроек сети..."
-    uci delete network.Mihomo 2>/dev/null
-    uci delete firewall.Mihomo 2>/dev/null
-    uci delete firewall.lan_to_Mihomo 2>/dev/null
+    echo "--> Очистка старых настроек UCI..."
+    uci delete network.Mihomo 2>/dev/null || true
 
-    echo "--> Настройка UCI-сервиса..."
+    local fw_section
+    for fw_section in $(uci show firewall 2>/dev/null \
+            | grep -E "\.name='Mihomo'" \
+            | sed "s/\.name.*//"); do
+        uci delete "$fw_section" 2>/dev/null || true
+    done
+
+    for fw_section in $(uci show firewall 2>/dev/null \
+            | grep -E "\.(src|dest)='Mihomo'" \
+            | sed -E "s/\.(src|dest).*//"); do
+        uci delete "$fw_section" 2>/dev/null || true
+    done
+
+    uci delete firewall.Mihomo 2>/dev/null || true
+    uci delete firewall.lan_to_Mihomo 2>/dev/null || true
+    uci commit firewall
+    /etc/init.d/firewall restart 2>/dev/null || true
+    sleep 1
+
+    echo "--> Настройка UCI-сервиса hev-socks5-tunnel..."
     uci set hev-socks5-tunnel.config.enabled='1'
     uci set hev-socks5-tunnel.config.configfile='/etc/hev-socks5-tunnel/main.yml'
     uci commit hev-socks5-tunnel
@@ -1153,7 +1256,6 @@ EOF
     sleep 2
 
     echo "--> Настройка сетевого интерфейса..."
-    uci delete network.Mihomo 2>/dev/null || true
     uci set network.Mihomo=interface
     uci set network.Mihomo.proto='none'
     uci set network.Mihomo.device='Mihomo'
@@ -1161,146 +1263,170 @@ EOF
     /etc/init.d/network reload
 
     echo "--> Настройка firewall..."
-    uci delete firewall.Mihomo 2>/dev/null || true
-    uci delete firewall.lan_to_Mihomo 2>/dev/null || true
+    local FW_ZONE
+    FW_ZONE=$(uci add firewall zone)
+    uci set "firewall.${FW_ZONE}.name=Mihomo"
+    uci set "firewall.${FW_ZONE}.input=REJECT"
+    uci set "firewall.${FW_ZONE}.output=REJECT"
+    uci set "firewall.${FW_ZONE}.forward=REJECT"
+    uci set "firewall.${FW_ZONE}.masq=1"
+    uci set "firewall.${FW_ZONE}.mtu_fix=1"
+    uci add_list "firewall.${FW_ZONE}.network=Mihomo"
 
-    uci set firewall.Mihomo=zone
-    uci set firewall.Mihomo.name='Mihomo'
-    uci set firewall.Mihomo.input='REJECT'
-    uci set firewall.Mihomo.output='REJECT'
-    uci set firewall.Mihomo.forward='REJECT'
-    uci set firewall.Mihomo.masq='1'
-    uci set firewall.Mihomo.mtu_fix='1'
-    uci add_list firewall.Mihomo.network='Mihomo'
-
-    uci set firewall.lan_to_Mihomo=forwarding
-    uci set firewall.lan_to_Mihomo.src='lan'
-    uci set firewall.lan_to_Mihomo.dest='Mihomo'
+    local FW_FWD
+    FW_FWD=$(uci add firewall forwarding)
+    uci set "firewall.${FW_FWD}.src=lan"
+    uci set "firewall.${FW_FWD}.dest=Mihomo"
 
     uci commit firewall
     /etc/init.d/firewall restart
 }
 
-install_magitrickle() {
-    
-    echo "--> Подготовка к установке MagiTrickle..."
-    
-    local CONFIG_PATH="/etc/magitrickle/state/config.yaml"
-    local BACKUP_PATH="/tmp/magitrickle_config_backup.yaml"
-    
-    if [ -f "$CONFIG_PATH" ]; then
-        cp "$CONFIG_PATH" "$BACKUP_PATH"
+_magitrickle_apk() {
+    local OPENWRT_ARCH
+    OPENWRT_ARCH=$(grep "^OPENWRT_ARCH=" /etc/os-release | cut -d'"' -f2)
+    [ -n "$OPENWRT_ARCH" ] || { log_error "Не удалось определить архитектуру из /etc/os-release"; return 1; }
+    echo "--> Архитектура OpenWrt: $OPENWRT_ARCH"
+
+    local APK_NAME="magitrickle_${MT_VERSION_APK}_${MT_PRE_APK}-r1_openwrt_${OPENWRT_ARCH}.apk"
+    local APK_URL="https://gitlab.com/api/v4/projects/69165954/jobs/artifacts/develop/raw/.build/${APK_NAME}?job=build"
+    local TMP_APK="/tmp/magitrickle.apk"
+
+    echo "--> Скачивание: $APK_NAME"
+    if ! curl -Lf --retry 3 --retry-delay 2 -o "$TMP_APK" "$APK_URL"; then
+        log_error "Ошибка скачивания пакета"
+        log_error "URL: $APK_URL"
+        rm -f "$TMP_APK"
+        return 1
     fi
-    
-    if opkg list-installed magitrickle_mod >/dev/null 2>&1; then
-        opkg remove magitrickle_mod >/dev/null 2>&1
+
+    if [ ! -s "$TMP_APK" ]; then
+        log_error "Скачанный файл пустой. Проверьте MT_VERSION_APK и MT_PRE_APK в начале скрипта."
+        rm -f "$TMP_APK"
+        return 1
     fi
-    if opkg list-installed magitrickle >/dev/null 2>&1; then
-        opkg remove magitrickle >/dev/null 2>&1
-    fi
-            ARCH_SYS=$(grep "OPENWRT_ARCH" /etc/os-release | awk -F '"' '{print $2}')
+
+    echo "--> Установка пакета..."
+    apk add --allow-untrusted "$TMP_APK" || { log_error "Ошибка установки MagiTrickle"; rm -f "$TMP_APK"; return 1; }
+    rm -f "$TMP_APK"
+
+    /etc/init.d/magitrickle enable 2>/dev/null || true
+    /etc/init.d/magitrickle start 2>/dev/null || true
+}
+
+_magitrickle_opkg() {
+    echo "Выберите версию MagiTrickle для установки:"
+    echo "1) Оригинал v${MT_VERSION_OPKG} (https://magitrickle.dev/docs/welcome/)"
+    echo "2) Мод от LarinIvan (https://github.com/LarinIvan/MagiTrickle_Mod/)"
+    printf "-> "
+    local CHOICE
+    read -r CHOICE
+
+    case "$CHOICE" in
+        1)
+            if ! wget --version > /dev/null 2>&1; then
+                log_warn "wget не работает, переустановка..."
+                opkg remove wget-ssl > /dev/null 2>&1
+                opkg install wget --force-reinstall > /dev/null 2>&1 || {
+                    log_error "Критическая ошибка: не удалось переустановить wget"
+                    return 1
+                }
+                log_info "wget успешно переустановлен..."
+            fi
+
+            local ARCH_SYS
+            ARCH_SYS=$(grep "^OPENWRT_ARCH=" /etc/os-release | cut -d'"' -f2)
             [ -n "$ARCH_SYS" ] || { log_error "Не удалось определить архитектуру OpenWrt"; return 1; }
             echo "--> Архитектура: $ARCH_SYS"
-            IPK="magitrickle_0.5.2-2_openwrt_${ARCH_SYS}.ipk"
-            URL="https://gitlab.com/api/v4/projects/69165954/packages/generic/magitrickle/0.5.2/$IPK"
-            cd /tmp
-			echo "--> Установка MagiTrickle..."
-            wget -q -O "$IPK" "$URL" || { log_error "Ошибка скачивания оригинального MagiTrickle"; return 1; }
-            opkg install "$IPK" >/dev/null 2>&1 || return 1
-            rm -f "$IPK"
-			echo "--> Установка списка для MagiTrickle..."
-			
-confWRT="/etc/magitrickle/state/config.yaml"
-confGIT="https://raw.githubusercontent.com/StressOzz/Use_WARP_on_OpenWRT/refs/heads/main/files/MagiTrickle/configAD.yaml"
 
-  wget -q -O "$confWRT" "$confGIT" || {
-    echo "Ошибка: не удалось скачать список!"
-    echo "URL: $MAGITRICKLE_CONFIG_URL"
-    return 1
-  }
+            local IPK="magitrickle_${MT_VERSION_OPKG}-2_openwrt_${ARCH_SYS}.ipk"
+            local URL="https://gitlab.com/api/v4/projects/69165954/packages/generic/magitrickle/${MT_VERSION_OPKG}/$IPK"
 
-            echo "--> Включение автозапуска MagiTrickle..."
-            /etc/init.d/magitrickle enable >/dev/null 2>&1
-            echo "--> Запуск MagiTrickle..."
-			/etc/init.d/magitrickle reload  >/dev/null 2>&1
-			/etc/init.d/magitrickle start >/dev/null 2>&1
-            /etc/init.d/magitrickle restart >/dev/null 2>&1
-    
-    compare_versions() {
-        local v1="$1"
-        local v2="$2"
-        
-        local IFS='.'
-        set -- $v1
-        local v1_major="$1" v1_minor="$2" v1_patch="$3"
-        set -- $v2
-        local v2_major="$1" v2_minor="$2" v2_patch="$3"
-        
-        v1_major="${v1_major:-0}"
-        v1_minor="${v1_minor:-0}"
-        v1_patch="${v1_patch:-0}"
-        v2_major="${v2_major:-0}"
-        v2_minor="${v2_minor:-0}"
-        v2_patch="${v2_patch:-0}"
-        
-        if [ "$v1_major" -gt "$v2_major" ]; then
+            wget -O "/tmp/$IPK" "$URL" || { log_error "Ошибка скачивания оригинального MagiTrickle"; return 1; }
+            opkg install "/tmp/$IPK" || return 1
+            rm -f "/tmp/$IPK"
+
+            /etc/init.d/magitrickle enable > /dev/null 2>&1
+            /etc/init.d/magitrickle start > /dev/null 2>&1
+            ;;
+        2)
+            log_info "Установка MagiTrickle_Mod..."
+            wget -O- https://raw.githubusercontent.com/LarinIvan/MagiTrickle_Mod/develop/add_repo.sh | sh || return 1
+            ;;
+        *)
+            log_error "Неверный выбор"
             return 1
-        elif [ "$v1_major" -lt "$v2_major" ]; then
-            return 2
-        fi
-        
-        if [ "$v1_minor" -gt "$v2_minor" ]; then
-            return 1
-        elif [ "$v1_minor" -lt "$v2_minor" ]; then
-            return 2
-        fi
-        
-        if [ "$v1_patch" -gt "$v2_patch" ]; then
-            return 1
-        elif [ "$v1_patch" -lt "$v2_patch" ]; then
-            return 2
-        fi
-        
-        return 0
-    }
-    
-    if [ -f "$BACKUP_PATH" ] && [ -f "$CONFIG_PATH" ]; then
-        echo "--> Проверка версии конфигурации..."
-        
-        OLD_VERSION=$(grep "^configVersion:" "$BACKUP_PATH" | awk '{print $2}' | tr -d ' ')
-        NEW_VERSION=$(grep "^configVersion:" "$CONFIG_PATH" | awk '{print $2}' | tr -d ' ')
-        
-        if [ -z "$OLD_VERSION" ] || [ -z "$NEW_VERSION" ]; then
-            log_warn "Не удалось определить версию конфигурации. Бэкап сохранен рядом."
-            cp "$BACKUP_PATH" "${CONFIG_PATH}.backup"
-            rm -f "$BACKUP_PATH"
-        else
-            compare_versions "$OLD_VERSION" "$NEW_VERSION"
-            local result=$?
-            
-            case $result in
-                0)  rm -f "$BACKUP_PATH"
-                    ;;
-                1)  log_warn "Версия старой конфигурации ($OLD_VERSION) выше новой ($NEW_VERSION)! Бэкап сохранен рядом."
-                    cp "$BACKUP_PATH" "${CONFIG_PATH}.backup"
-                    rm -f "$BACKUP_PATH"
-                    ;;
-                2)  log_info "Новая версия конфигурации ($NEW_VERSION) выше старой ($OLD_VERSION). Бэкап сохранен рядом."
-                    cp "$BACKUP_PATH" "${CONFIG_PATH}.backup"
-                    rm -f "$BACKUP_PATH"
-                    ;;
-            esac
-        fi
-    elif [ -f "$BACKUP_PATH" ]; then
-        log_warn "Новая конфигурация не найдена. Восстанавление из бэкапа..."
-        mkdir -p "$(dirname "$CONFIG_PATH")"
-        cp "$BACKUP_PATH" "$CONFIG_PATH"
+            ;;
+    esac
+}
+
+_magitrickle_restore_config() {
+    local CONFIG_PATH="/etc/magitrickle/state/config.yaml"
+    local BACKUP_PATH="$1"
+
+    [ -f "$BACKUP_PATH" ] || return 0
+    [ -f "$CONFIG_PATH" ] || { mkdir -p "$(dirname "$CONFIG_PATH")"; cp "$BACKUP_PATH" "$CONFIG_PATH"; rm -f "$BACKUP_PATH"; return 0; }
+
+    local OLD_VERSION NEW_VERSION
+    OLD_VERSION=$(grep "^configVersion:" "$BACKUP_PATH" | awk '{print $2}' | tr -d ' ')
+    NEW_VERSION=$(grep "^configVersion:" "$CONFIG_PATH" | awk '{print $2}' | tr -d ' ')
+
+    if [ -z "$OLD_VERSION" ] || [ -z "$NEW_VERSION" ]; then
+        log_warn "Не удалось определить версию конфигурации. Бэкап сохранен как ${CONFIG_PATH}.backup"
+        cp "$BACKUP_PATH" "${CONFIG_PATH}.backup"
         rm -f "$BACKUP_PATH"
+        return 0
     fi
-    
+
+    local o1 o2 o3 n1 n2 n3
+    o1=$(echo "$OLD_VERSION" | cut -d'.' -f1)
+    o2=$(echo "$OLD_VERSION" | cut -d'.' -f2)
+    o3=$(echo "$OLD_VERSION" | cut -d'.' -f3)
+    n1=$(echo "$NEW_VERSION" | cut -d'.' -f1)
+    n2=$(echo "$NEW_VERSION" | cut -d'.' -f2)
+    n3=$(echo "$NEW_VERSION" | cut -d'.' -f3)
+    o1=${o1:-0}; o2=${o2:-0}; o3=${o3:-0}
+    n1=${n1:-0}; n2=${n2:-0}; n3=${n3:-0}
+
+    if [ "$o1" -eq "$n1" ] && [ "$o2" -eq "$n2" ] && [ "$o3" -eq "$n3" ]; then
+        echo "--> Версии конфигурации совпадают ($OLD_VERSION). Восстановление..."
+        cp "$BACKUP_PATH" "$CONFIG_PATH"
+    elif [ "$o1" -gt "$n1" ] || { [ "$o1" -eq "$n1" ] && [ "$o2" -gt "$n2" ]; } || { [ "$o1" -eq "$n1" ] && [ "$o2" -eq "$n2" ] && [ "$o3" -gt "$n3" ]; }; then
+        log_warn "Старая конфигурация ($OLD_VERSION) новее новой ($NEW_VERSION). Бэкап: ${CONFIG_PATH}.backup"
+        cp "$BACKUP_PATH" "${CONFIG_PATH}.backup"
+    else
+        log_info "Новая версия конфигурации ($NEW_VERSION) выше старой ($OLD_VERSION). Бэкап: ${CONFIG_PATH}.backup"
+        cp "$BACKUP_PATH" "${CONFIG_PATH}.backup"
+    fi
+
+    rm -f "$BACKUP_PATH"
+}
+
+install_magitrickle() {
+    local CONFIG_PATH="/etc/magitrickle/state/config.yaml"
+    local BACKUP_PATH="/tmp/magitrickle_config_backup.yaml"
+
+    [ -f "$CONFIG_PATH" ] && cp "$CONFIG_PATH" "$BACKUP_PATH"
+
+    if [ "$USE_APK" -eq 1 ]; then
+        apk del magitrickle 2>/dev/null || true
+    else
+        opkg remove magitrickle_mod 2>/dev/null || true
+        opkg remove magitrickle 2>/dev/null || true
+    fi
+
+    if [ "$USE_APK" -eq 1 ]; then
+        _magitrickle_apk || return 1
+    else
+        _magitrickle_opkg || return 1
+    fi
+
+    _magitrickle_restore_config "$BACKUP_PATH"
+
     echo "--> Создание страницы MagiTrickle в LuCI..."
     mkdir -p /www/luci-static/resources/view/magitrickle
-cat << 'EOF' > /www/luci-static/resources/view/magitrickle/magitrickle.js
+
+    cat > /www/luci-static/resources/view/magitrickle/magitrickle.js <<'EOF'
 'use strict';
 'require view';
 return view.extend({
@@ -1319,7 +1445,8 @@ return view.extend({
     }
 });
 EOF
-cat << 'EOF' > /usr/share/luci/menu.d/luci-app-magitrickle.json
+
+    cat > /usr/share/luci/menu.d/luci-app-magitrickle.json <<'EOF'
 {
     "admin/services/magitrickle": {
         "title": "MagiTrickle",
@@ -1334,10 +1461,10 @@ EOF
 }
 
 finalize_install() {
-    echo "--> Выставление необходимых прав доступа..."
+    echo "--> Выставление прав доступа..."
     chmod -R 755 /www/luci-static/resources/view/mihomo 2>/dev/null || true
     find /www/luci-static/resources/view/mihomo -type f -exec chmod 644 {} \; 2>/dev/null || true
-    chmod 644 /www/luci-static/resources/view/magitrickle/magitrickle.js
+    chmod 644 /www/luci-static/resources/view/magitrickle/magitrickle.js 2>/dev/null || true
 
     echo "--> Очистка кэша LuCI и перезапуск сервисов..."
     rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/
@@ -1346,25 +1473,48 @@ finalize_install() {
 }
 
 main() {
-	clear
-    log_done "Скрипт установки Mixomo OpenWRT $SCRIPT_VERSION"
-	log_done "        от Internet Helper (StressOzz Remix)"
-	echo ""
-	
-    log_step "[1/3] Установка Mihomo"
+    clear
+    log_done "Скрипт установки Mixomo OpenWRT $SCRIPT_VERSION от Internet Helper"
+    echo ""
+
+    log_step "[1/5] Установка зависимостей"
+    install_deps || step_fail
+    echo ""
+
+    log_step "[2/5] Установка Mihomo"
     install_mihomo || step_fail
-	echo ""
-	
-    log_step "[2/3] Установка Hev-Socks5-Tunnel"
+    echo ""
+
+    log_step "[3/5] Установка Hev-Socks5-Tunnel"
     install_hev_tunnel || step_fail
-	echo ""
-	
-    log_step "[3/3] Установка MagiTrickle"
+    echo ""
+
+    log_step "[4/5] Установка MagiTrickle"
     install_magitrickle || step_fail
+    echo ""
+
+    log_step "[5/5] Завершение"
     finalize_install || step_fail
-	echo ""
-	
-	log_step "Установка Mixomo OpenWRT $SCRIPT_VERSION прошла успешно!"
+    echo ""
+
+    log_step "Установка Mixomo OpenWRT $SCRIPT_VERSION прошла успешно!"
+    echo ""
+    log_done "┌───────────────────────────────────────────────────────────────────────┐"
+    log_done "│ 1. Выйдите из LuCI и войдите снова                                    │"
+    log_done "├───────────────────────────────────────────────────────────────────────┤"
+    log_done "│ 2. Службы или Services → Mihomo → Настройте конфигурацию              │"
+    log_done "│    ${CYAN}[Генератор конфигурации]                                           ${GREEN}│"
+    log_done "│    ${CYAN}https://spatiumstas.github.io/web4core/                            ${GREEN}│"
+    log_done "│    ${CYAN}[Готовые конфигурации]                                             ${GREEN}│"
+    log_done "│    ${CYAN}https://secret-harbor.notion.site/31345fc37b6f80fa82d3da96e9ae12cc ${GREEN}│"
+    log_done "├───────────────────────────────────────────────────────────────────────┤"
+    log_done "│ 3. Службы или Services → MagiTrickle → Создайте списки                │"
+    log_done "│    ${CYAN}[Готовые конфигурации]                                             ${GREEN}│"
+    log_done "│    ${CYAN}https://secret-harbor.notion.site/31345fc37b6f80fa82d3da96e9ae12cc ${GREEN}│"
+    log_done "├───────────────────────────────────────────────────────────────────────┤"
+    log_done "│ 4. Наслаждайтесь интернетом :)                                        │"
+    log_done "└───────────────────────────────────────────────────────────────────────┘"
+    echo ""
 }
 
 main
