@@ -1169,8 +1169,7 @@ rm -f "$FILE"
 	echo "--> Установка списка для MagiTrickle..."
 	confGIT="https://raw.githubusercontent.com/StressOzz/Use_WARP_on_OpenWRT/refs/heads/main/files/MagiTrickle/configAD.yaml"
 	wget -q -O "$CONFIG_PATH" "$confGIT" || {
-    echo "Ошибка: не удалось скачать список!"
-    echo "URL: $MAGITRICKLE_CONFIG_URL"
+    echo -e "${RED}Не удалось скачать список!${NC}"
     return 1
 	}
 	echo "--> Запуск MagiTrickle..."
