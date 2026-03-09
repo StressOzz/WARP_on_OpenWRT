@@ -9,7 +9,67 @@ CYAN="\033[1;36m"
 
 clear
 
-echo -e "${MAGENTA}Генерируем WARP.conf${NC}"
+chose_endpoint() {
+
+echo -e "${CYAN}Получаем список ${NC}Endpoint"
+
+EP_LIST="$(curl -fsSL https://raw.githubusercontent.com/STR97/STRUGOV/refs/heads/main/end%20point)" || {
+    echo -e "${RED}Не удалось загрузить список Endpoint${NC}"
+    exit 1
+}
+
+
+echo -e "\n${MAGENTA}Выберите страну:${NC}"
+
+i=1
+
+while IFS='|' read -r name ep; do
+
+    case "$name" in
+        *Текущая*) country="Россия    " ;;
+        *Нидерланд*) country="Нидерланды" ;;
+        *Америка*) country="Америка   " ;;
+        *Сингапур*) country="Сингапур  " ;;
+        *Латвия*) country="Латвия    " ;;
+        *Герман*) country="Германия  " ;;
+        *Литва*) country="Литва     " ;;
+        *Финлянд*) country="Финляндия " ;;
+        *) country="$name" ;;
+    esac
+
+    host="${ep%%:*}"
+
+ping_ms="$(ping -c1 -W1 "$host" 2>/dev/null | awk -F'/' 'END{print $5}')"
+[ -z "$ping_ms" ] && ping_ms="FAIL"
+
+if [ "$ping_ms" = "FAIL" ]; then
+    printf "${CYAN}%2d) ${GREEN}%s ${MAGENTA}| ${RED}%s${NC}\n" "$i" "$country" "$ping_ms"
+else
+    printf "${CYAN}%2d) ${GREEN}%s ${MAGENTA}| ${YELLOW}%s${NC}\n" "$i" "$country" "$ping_ms"
+fi
+
+    i=$((i+1))
+
+done <<EOF
+$EP_LIST
+EOF
+
+echo -en "\n${YELLOW}Введите номер:${NC} "
+read num
+
+# Проверяем, что введено число и оно в диапазоне
+MAX_NUM=$(echo "$EP_LIST" | wc -l)
+if ! printf '%s' "$num" | grep -qE '^[0-9]+$' || [ "$num" -lt 1 ] || [ "$num" -gt "$MAX_NUM" ]; then
+    ENDPOINT="engage.cloudflareclient.com:4500"
+else
+    ENDPOINT="$(echo "$EP_LIST" | sed -n "${num}p" | cut -d'|' -f2)"
+    [ -z "$ENDPOINT" ] && ENDPOINT="engage.cloudflareclient.com:4500"
+fi
+
+echo
+}
+
+echo -e "${MAGENTA}Генерируем WARP${NC}"
 
 if command -v apk >/dev/null 2>&1; then
 PKG="apk"
@@ -20,7 +80,7 @@ echo -e "${RED}Не найден пакетный менеджер!${NC}"
 exit 1
 fi
 
-echo -e "${CYAN}Обновляем пакеты...${NC}"
+echo -e "${CYAN}Обновляем пакеты${NC}"
 
 if [ "$PKG" = "apk" ]; then
 apk update >/dev/null 2>&1 || {
@@ -54,13 +114,13 @@ exit 1
 fi
 }
 
-echo -e "${CYAN}Проверяем зависимости...${NC}"
+echo -e "${CYAN}Проверяем зависимости${NC}"
 
 for pkg in wireguard-tools curl jq coreutils-base64; do
 install_pkg "$pkg"
 done
 
-echo -e "${YELLOW}Генерируем ключи...${NC}"
+echo -e "${CYAN}Генерируем ключи${NC}"
 priv="$(wg genkey)"
 pub="$(printf "%s" "$priv" | wg pubkey)"
 
@@ -77,7 +137,7 @@ sec() {
 ins "$1" "$2" -H "Authorization: Bearer $3" "${@:4}"
 }
 
-echo -e "${CYAN}Регистрируем устройство в Cloudflare...${NC}"
+echo -e "${CYAN}Регистрируем устройство в ${NC}Cloudflare"
 
 response=$(ins POST "reg" \
 -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%FT%TZ)\",\"key\":\"${pub}\",\"fcm_token\":\"\",\"type\":\"ios\",\"locale\":\"en_US\"}")
@@ -90,7 +150,11 @@ echo -e "${RED}Ошибка регистрации${NC} $response"
 exit 1
 fi
 
-echo -e "${GREEN}Активируем WARP...${NC}"
+################################################################################################
+chose_endpoint
+################################################################################################
+
+echo -e "${GREEN}Активируем и генерируем ${NC}WARP${NC}"
 
 response=$(sec PATCH "reg/${id}" "$token" -d '{"warp_enabled":true}')
 
@@ -123,7 +187,7 @@ I1 = <b 0x5245474953544552207369703a676f6f676c652e636f6d205349502f322e300d0a5669
 [Peer]
 PublicKey = ${peer_pub}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = engage.cloudflareclient.com:4500
+Endpoint = ${ENDPOINT}
 PersistentKeepalive = 25
 EOF
 )
@@ -132,7 +196,6 @@ echo
 echo -e "${GREEN}========== ${YELLOW}WARP CONFIG${GREEN} ==========${NC}"
 echo "$conf"
 echo -e "${GREEN}=================================${NC}"
-echo
 
 echo "$conf" > /root/WARP.conf
-echo -e "${YELLOW}Файл сохранён:${NC} /root/WARP.conf"
+echo -e "\n${YELLOW}Файл сохранён:${NC} /root/WARP.conf"
