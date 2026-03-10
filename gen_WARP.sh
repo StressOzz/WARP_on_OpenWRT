@@ -1,5 +1,14 @@
 #!/bin/sh
 
+EP_LIST='Россия    |engage.cloudflareclient.com:4500
+Латвия    |150.241.75.91:4500
+Германия  |de.tribukvy.ltd:4501
+Литва     |lt.tribukvy.ltd:4501
+Нидерланды|nl3.tribukvy.ltd:4501
+Нидерланды|nl0.tribukvy.ltd:4501
+Финляндия |fi.tribukvy.ltd:4501
+Финляндия |fi0.tribukvy.ltd:4501'
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -11,59 +20,66 @@ clear
 
 chose_endpoint() {
 
-echo -e "${CYAN}Получаем список ${NC}Endpoint"
-
-EP_LIST="$(curl -fsSL https://raw.githubusercontent.com/STR97/STRUGOV/refs/heads/main/end%20point)" || {
-    echo -e "${RED}Не удалось загрузить список Endpoint${NC}"
-    exit 1
-}
-
-
 echo -e "\n${MAGENTA}Выберите страну:${NC}"
 
-i=1
+TMP_FILE=$(mktemp)
 
-while IFS='|' read -r name ep; do
+while IFS='|' read -r country ep; do
+(
+host="${ep%%:*}"
 
-    case "$name" in
-        *Текущая*) country="Россия    " ;;
-        *Нидерланд*) country="Нидерланды" ;;
-        *Америка*) country="Америка   " ;;
-        *Сингапур*) country="Сингапур  " ;;
-        *Латвия*) country="Латвия    " ;;
-        *Герман*) country="Германия  " ;;
-        *Литва*) country="Литва     " ;;
-        *Финлянд*) country="Финляндия " ;;
-        *) country="$name" ;;
-    esac
+ping_ms="$(ping -c1 -W1 "$host" 2>/dev/null | awk -F'/' 'END{print int($5)}')"
 
-    host="${ep%%:*}"
-
-ping_ms="$(ping -c1 -W1 "$host" 2>/dev/null | awk -F'/' 'END{print $5}')"
-[ -z "$ping_ms" ] && ping_ms="FAIL"
-
-if [ "$ping_ms" = "FAIL" ]; then
-    printf "${CYAN}%2d) ${GREEN}%s ${MAGENTA}| ${RED}%s${NC}\n" "$i" "$country" "$ping_ms"
+if [ -z "$ping_ms" ] || [ "$ping_ms" -eq 0 ]; then
+ping_val="FAIL"
+ping_sort=9999
 else
-    printf "${CYAN}%2d) ${GREEN}%s ${MAGENTA}| ${YELLOW}%s${NC}\n" "$i" "$country" "$ping_ms"
+ping_val="${ping_ms} ms"
+ping_sort="$ping_ms"
 fi
 
-    i=$((i+1))
-
+echo "${ping_sort}|${country}|${ep}|${ping_val}" >> "$TMP_FILE"
+) &
 done <<EOF
 $EP_LIST
 EOF
 
+wait
+
+SORTED_LIST=$(sort -t'|' -k1n "$TMP_FILE")
+rm -f "$TMP_FILE"
+
+i=1
+echo "$SORTED_LIST" | while IFS='|' read -r ping_sort country ep ping_val; do
+
+    if [ "$ping_val" = "FAIL" ]; then
+        color="$RED"
+    else
+        ping_num=${ping_val%% *}
+        if [ "$ping_num" -lt 50 ]; then
+            color="$GREEN"
+        elif [ "$ping_num" -lt 100 ]; then
+            color="$YELLOW"
+        else
+            color="$RED"
+        fi
+    fi
+
+printf "${CYAN}%2d) ${GREEN}%-10s ${MAGENTA}| ${color}%-7s${MAGENTA}| ${CYAN}%s${NC}\n" "$i" "$country" "$ping_val" "$ep"
+
+i=$((i+1))
+done
+
 echo -en "\n${YELLOW}Введите номер:${NC} "
 read num
 
-# Проверяем, что введено число и оно в диапазоне
-MAX_NUM=$(echo "$EP_LIST" | wc -l)
+MAX_NUM=$(echo "$SORTED_LIST" | wc -l)
+
 if ! printf '%s' "$num" | grep -qE '^[0-9]+$' || [ "$num" -lt 1 ] || [ "$num" -gt "$MAX_NUM" ]; then
-    ENDPOINT="engage.cloudflareclient.com:4500"
+ENDPOINT="engage.cloudflareclient.com:4500"
 else
-    ENDPOINT="$(echo "$EP_LIST" | sed -n "${num}p" | cut -d'|' -f2)"
-    [ -z "$ENDPOINT" ] && ENDPOINT="engage.cloudflareclient.com:4500"
+ENDPOINT="$(echo "$SORTED_LIST" | sed -n "${num}p" | cut -d'|' -f3)"
+[ -z "$ENDPOINT" ] && ENDPOINT="engage.cloudflareclient.com:4500"
 fi
 
 echo
